@@ -730,7 +730,10 @@ def s3_handler(event, context, metadata):
     key = urllib.parse.unquote_plus(event["Records"][0]["s3"]["object"]["key"])
 
     source = parse_event_source(event, key)
-    metadata[DD_SOURCE] = source
+    if DD_SOURCE is not None:
+        metadata[DD_SOURCE] = DD_SOURCE
+    else:
+        metadata[DD_SOURCE] = source
     ##default service to source value
     metadata[DD_SERVICE] = source
     ##Get the ARN of the service and set it as the hostname
