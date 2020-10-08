@@ -17,8 +17,8 @@ logger.setLevel(logging.getLevelName(os.environ.get("DD_LOG_LEVEL", "INFO").uppe
 
 def get_env_var(envvar, default, boolean=False):
     """
-        Return the value of the given environment variable with debug logging.
-        When boolean=True, parse the value as a boolean case-insensitively.
+    Return the value of the given environment variable with debug logging.
+    When boolean=True, parse the value as a boolean case-insensitively.
     """
     value = os.getenv(envvar, default=default)
     if boolean:
@@ -103,12 +103,15 @@ DD_SITE = get_env_var("DD_SITE", default="datadoghq.com")
 DD_TAGS = get_env_var("DD_TAGS", "")
 
 ## @param DD_API_URL - Url to use for  validating the the api key.
-DD_API_URL = get_env_var("DD_API_URL", default="https://api.{}".format(DD_SITE))
-logger.debug(f"DD_API_URL: {DD_API_URL}")
+DD_API_URL = get_env_var(
+    "DD_API_URL",
+    default="{}://api.{}".format("http" if DD_NO_SSL else "https", DD_SITE),
+)
 
 ## @param DD_TRACE_INTAKE_URL
 DD_TRACE_INTAKE_URL = get_env_var(
-    "DD_TRACE_INTAKE_URL", default="https://trace.agent.{}".format(DD_SITE)
+    "DD_TRACE_INTAKE_URL",
+    default="{}://trace.agent.{}".format("http" if DD_NO_SSL else "https", DD_SITE),
 )
 
 if DD_USE_TCP:
@@ -123,6 +126,9 @@ if DD_USE_TCP:
 else:
     DD_URL = get_env_var("DD_URL", default="lambda-http-intake.logs." + DD_SITE)
     DD_PORT = int(get_env_var("DD_PORT", default="443"))
+
+## @param DD_USE_VPC
+DD_USE_VPC = get_env_var("DD_USE_VPC", "false", boolean=True)
 
 ## @param DD_USE_PRIVATE_LINK - whether to forward logs via PrivateLink
 ## Overrides incompatible settings
@@ -206,4 +212,14 @@ DD_SOURCE = "ddsource"
 DD_CUSTOM_TAGS = "ddtags"
 DD_SERVICE = "service"
 DD_HOST = "host"
-DD_FORWARDER_VERSION = "3.16.8"
+DD_FORWARDER_VERSION = "3.20.0"
+
+# Additional target lambda invoked async with event data
+DD_ADDITIONAL_TARGET_LAMBDAS = get_env_var("DD_ADDITIONAL_TARGET_LAMBDAS", default=None)
+
+DD_S3_BUCKET_NAME = get_env_var("DD_S3_BUCKET_NAME", default=None)
+DD_S3_CACHE_FILENAME = "cache.json"
+DD_S3_CACHE_LOCK_FILENAME = "cache.lock"
+
+DD_TAGS_CACHE_TTL_SECONDS = int(get_env_var("DD_TAGS_CACHE_TTL_SECONDS", default=300))
+DD_S3_CACHE_LOCK_TTL_SECONDS = 60

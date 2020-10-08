@@ -11,6 +11,7 @@ const STRING = 'string'; // example: 'some message'
 const STRING_ARRAY = 'string-array'; // example: ['one message', 'two message', ...]
 const JSON_OBJECT = 'json-object'; // example: {"key": "value"}
 const JSON_ARRAY = 'json-array'; // example: [{"key": "value"}, {"key": "value"}, ...] or [{"records": [{}, {}, ...]}, {"records": [{}, {}, ...]}, ...]
+const BUFFER_ARRAY = 'buffer-array'; // example: [<Buffer obj>, <Buffer obj>]
 const JSON_STRING = 'json-string'; // example: '{"key": "value"}'
 const JSON_STRING_ARRAY = 'json-string-array'; // example: ['{"records": [{}, {}]}'] or ['{"key": "value"}']
 const INVALID = 'invalid';
@@ -113,6 +114,9 @@ class EventhubLogForwarder {
             case JSON_ARRAY:
                 promises = this.handleJSONArrayLogs(logs, JSON_ARRAY);
                 break;
+            case BUFFER_ARRAY:
+                this.handleJSONArrayLogs(logs, BUFFER_ARRAY);
+                break;
             case JSON_STRING_ARRAY:
                 promises = this.handleJSONArrayLogs(logs, JSON_STRING_ARRAY);
                 break;
@@ -135,6 +139,20 @@ class EventhubLogForwarder {
                         'log is malformed json, sending as string'
                     );
                     promises.push(this.formatLogAndSend(STRING_TYPE, message));
+                    return;
+                }
+            }
+            // If the message is a buffer object, the data type has been set to binary.
+            if (logsType == BUFFER_ARRAY) {
+                try {
+                    message = JSON.parse(message.toString());
+                } catch (err) {
+                    this.context.log.warn(
+                        'log is malformed json, sending as string'
+                    );
+                    promises.push(
+                        this.formatLogAndSend(STRING_TYPE, message.toString())
+                    );
                     return;
                 }
             }
@@ -162,6 +180,9 @@ class EventhubLogForwarder {
         if (!Array.isArray(logs)) {
             return INVALID;
         }
+        if (Buffer.isBuffer(logs[0])) {
+            return BUFFER_ARRAY;
+        }
         if (typeof logs[0] === 'object') {
             return JSON_ARRAY;
         }
@@ -185,7 +206,7 @@ class EventhubLogForwarder {
     }
 
     addTagsToJsonLog(record) {
-        var metadata = this.extractResourceId(record);
+        var metadata = this.extractMetadataFromResource(record);
         record['ddsource'] = metadata.source || DD_SOURCE;
         record['ddsourcecategory'] = DD_SOURCE_CATEGORY;
         record['service'] = DD_SERVICE;
@@ -204,39 +225,58 @@ class EventhubLogForwarder {
         return this.addTagsToJsonLog(jsonLog);
     }
 
-    extractResourceId(record) {
+    formatSourceType(sourceType) {
+        if (sourceType.includes('microsoft.')) {
+            return sourceType.replace('microsoft.', 'azure.');
+        } else {
+            return '';
+        }
+    }
+
+    extractMetadataFromResource(record) {
         var metadata = { tags: [], source: '' };
         if (
             record.resourceId === undefined ||
             typeof record.resourceId !== 'string'
         ) {
             return metadata;
-        } else if (
-            record.resourceId.toLowerCase().startsWith('/subscriptions/')
-        ) {
-            var resourceId = record.resourceId.toLowerCase().split('/');
-            if (resourceId.length > 2) {
-                metadata.tags.push('subscription_id:' + resourceId[2]);
-            }
-            if (resourceId.length > 4) {
-                metadata.tags.push('resource_group:' + resourceId[4]);
-            }
-            if (resourceId.length > 6 && resourceId[6]) {
-                metadata.source = resourceId[6].replace('microsoft.', 'azure.');
-            }
-            return metadata;
-        } else if (record.resourceId.toLowerCase().startsWith('/tenants/')) {
-            var resourceId = record.resourceId.toLowerCase().split('/');
-            if (resourceId.length > 4 && resourceId[4]) {
-                metadata.tags.push('tenant:' + resourceId[2]);
-                metadata.source = resourceId[4]
-                    .replace('microsoft.', 'azure.')
-                    .replace('aadiam', 'activedirectory');
-            }
-            return metadata;
-        } else {
-            return metadata;
         }
+        var resourceId = record.resourceId.toLowerCase().split('/');
+        if (resourceId[0] === '') {
+            resourceId = resourceId.slice(1);
+        }
+        if (resourceId[resourceId.length - 1] === '') {
+            resourceId.pop();
+        }
+
+        if (resourceId[0] === 'subscriptions') {
+            if (resourceId.length > 1) {
+                metadata.tags.push('subscription_id:' + resourceId[1]);
+                if (resourceId.length == 2) {
+                    metadata.source = 'azure.subscription';
+                    return metadata;
+                }
+            }
+            if (resourceId.length > 3) {
+                metadata.tags.push('resource_group:' + resourceId[3]);
+                if (resourceId.length == 4) {
+                    metadata.source = 'azure.resourcegroup';
+                    return metadata;
+                }
+            }
+            if (resourceId.length > 5 && resourceId[5]) {
+                metadata.source = this.formatSourceType(resourceId[5]);
+            }
+        } else if (resourceId[0] === 'tenants') {
+            if (resourceId.length > 3 && resourceId[3]) {
+                metadata.tags.push('tenant:' + resourceId[1]);
+                metadata.source = this.formatSourceType(resourceId[3]).replace(
+                    'aadiam',
+                    'activedirectory'
+                );
+            }
+        }
+        return metadata;
     }
 }
 
@@ -251,7 +291,7 @@ module.exports = async function(context, eventHubMessages) {
         eventHubMessages
     );
 
-    return Promise.allSettled(promises);
+    return Promise.all(promises.map(p => p.catch(e => e)));
 };
 
 module.exports.forTests = {
@@ -261,6 +301,7 @@ module.exports.forTests = {
         STRING_ARRAY,
         JSON_OBJECT,
         JSON_ARRAY,
+        BUFFER_ARRAY,
         JSON_STRING,
         JSON_STRING_ARRAY,
         INVALID

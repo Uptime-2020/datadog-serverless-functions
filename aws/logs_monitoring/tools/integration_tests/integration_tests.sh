@@ -7,11 +7,21 @@
 
 set -e
 
-# Defaults
 PYTHON_VERSION="python3.7"
 SKIP_FORWARDER_BUILD=false
 UPDATE_SNAPSHOTS=false
 LOG_LEVEL=info
+LOGS_WAIT_SECONDS=10
+INTEGRATION_TESTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+SNAPSHOTS_DIR_NAME="snapshots"
+SNAPSHOT_DIR="${INTEGRATION_TESTS_DIR}/${SNAPSHOTS_DIR_NAME}/*"
+SNAPS=($SNAPSHOT_DIR)
+ADDITIONAL_LAMBDA=false
+CACHE_TEST=false 
+DD_FETCH_LAMBDA_TAGS="false"
+
+script_start_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "Starting script time: $script_start_time"
 
 # Parse arguments
 for arg in "$@"
@@ -46,6 +56,23 @@ do
 		LOG_LEVEL=debug
 		shift
 		;;
+
+		# -a or --additional-lambda
+		# Run additionalLambda tests
+
+		# Requires AWS credentials
+		# Use aws-vault exec sandbox-account-admin -- ./integration_tests.sh
+		-a|--additional-lambda)
+		ADDITIONAL_LAMBDA=true
+		shift
+		;;
+
+		# -c or --cache-test
+		# Run cache test
+		-c|--cache-test)
+		CACHE_TEST=true
+		shift
+		;;
 	esac
 done
 
@@ -54,8 +81,6 @@ if [ $PYTHON_VERSION != "python3.7" ] && [ $PYTHON_VERSION != "python3.8" ]; the
     exit 1
 fi
 
-INTEGRATION_TESTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-
 # Build the Forwarder
 if ! [ $SKIP_FORWARDER_BUILD == true ]; then
 	cd $INTEGRATION_TESTS_DIR
@@ -63,6 +88,60 @@ if ! [ $SKIP_FORWARDER_BUILD == true ]; then
 	./build_bundle.sh 0.0.0
 	cd ../.forwarder
 	unzip aws-dd-forwarder-0.0.0 -d aws-dd-forwarder-0.0.0
+fi
+
+if [ $CACHE_TEST == true ]; then
+
+	SNAPSHOTS_DIR_NAME="snapshots-cache-test"
+	DD_FETCH_LAMBDA_TAGS="true"
+
+	# Deploy test lambda functiion with tags
+	AWS_LAMBDA_FUNCTION_INVOKED="cache_test_lambda"
+	TEST_LAMBDA_DIR="$INTEGRATION_TESTS_DIR/$AWS_LAMBDA_FUNCTION_INVOKED"
+
+	cd $TEST_LAMBDA_DIR
+	sls deploy
+
+	FORWARDER_ARN="$(aws sts get-caller-identity | jq '.Arn')"
+	AWS_ACCOUNT_ID="$(aws sts get-caller-identity | jq '.Account')"
+
+	# Deploy test bucket
+	DD_S3_BUCKET_NAME=tags-cache-test
+	cat > policy.json << EOF
+{
+"Statement": [
+	{
+		"Effect": "Allow",
+		"Principal": {
+			"AWS": FORWARDER_ARN
+		},
+		"Action": [
+			"s3:DeleteObject",
+			"s3:PutObject",
+			"s3:GetObject"
+		],
+		"Resource": "arn:aws:s3:::DD_S3_BUCKET_NAME/*"
+	}
+]
+}
+EOF
+	sed -i '' "s/DD_S3_BUCKET_NAME/${DD_S3_BUCKET_NAME}/g" policy.json
+	sed -i '' "s|FORWARDER_ARN|${FORWARDER_ARN}|g" policy.json
+	aws s3api create-bucket --bucket $DD_S3_BUCKET_NAME
+	aws s3api put-bucket-policy --bucket $DD_S3_BUCKET_NAME --policy file://policy.json
+fi
+
+# Deploy additional target Lambdas
+if [ $ADDITIONAL_LAMBDA == true ]; then
+	SERVERLESS_NAME="forwarder-tests-external-lambda-dev"
+	EXTERNAL_LAMBDA_NAMES=("ironmaiden" "megadeth")
+	EXTERNAL_LAMBDA1="${SERVERLESS_NAME}-${EXTERNAL_LAMBDA_NAMES[0]}"
+	EXTERNAL_LAMBDA2="${SERVERLESS_NAME}-${EXTERNAL_LAMBDA_NAMES[1]}"
+	EXTERNAL_LAMBDAS="${EXTERNAL_LAMBDA1},${EXTERNAL_LAMBDA2}"
+	EXTERNAL_LAMBDA_DIR="${INTEGRATION_TESTS_DIR}/external_lambda"
+
+	cd $EXTERNAL_LAMBDA_DIR
+	sls deploy
 fi
 
 cd $INTEGRATION_TESTS_DIR
@@ -74,4 +153,83 @@ docker build --file "${INTEGRATION_TESTS_DIR}/forwarder/Dockerfile" -t "datadog-
     --build-arg image="lambci/lambda:${PYTHON_VERSION}"
 
 echo "Running integration tests for ${PYTHON_VERSION}"
-LOG_LEVEL=${LOG_LEVEL} UPDATE_SNAPSHOTS=${UPDATE_SNAPSHOTS} PYTHON_RUNTIME=${PYTHON_VERSION} docker-compose up --build --abort-on-container-exit
+LOG_LEVEL=${LOG_LEVEL} \
+UPDATE_SNAPSHOTS=${UPDATE_SNAPSHOTS} \
+PYTHON_RUNTIME=${PYTHON_VERSION} \
+EXTERNAL_LAMBDAS=${EXTERNAL_LAMBDAS} \
+DD_S3_BUCKET_NAME=${DD_S3_BUCKET_NAME} \
+AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID} \
+SNAPSHOTS_DIR_NAME="./${SNAPSHOTS_DIR_NAME}" \
+DD_FETCH_LAMBDA_TAGS=${DD_FETCH_LAMBDA_TAGS} \
+docker-compose up --build --abort-on-container-exit
+
+if [ $ADDITIONAL_LAMBDA == true ]; then
+	echo "Waiting for external lambda logs..."
+	sleep $LOGS_WAIT_SECONDS
+	cd $EXTERNAL_LAMBDA_DIR
+
+	for EXTERNAL_LAMBDA_NAME in "${EXTERNAL_LAMBDA_NAMES[@]}"; do
+		raw_logs=$(sls logs -f $EXTERNAL_LAMBDA_NAME --startTime $script_start_time)
+
+		# Extract json lines first, then the base64 gziped payload
+		logs=$(echo -e "$raw_logs" | grep -o '{.*}' | jq -r '.awslogs.data')
+		lambda_events=()
+
+		# We break up lines into an array
+		IFS=$'\n'
+		while IFS= read -r line; do
+			# we filter the first `{}` event in the recorder set up
+			if [ "$line" != "null" ]; then
+				lambda_events+=($(echo -e "$line"))
+			fi
+		done <<< "$logs"
+
+		if [ "${#lambda_events[@]}" -eq 0 ]; then
+			echo "FAILURE: No matching logs for the external lambda in Cloudwatch"
+			echo "Check with \`sls logs -f $EXTERNAL_LAMBDA_NAME --startTime $script_start_time\`"
+		    exit 1
+		fi
+
+		mismatch_found=false
+		# Verify every event passed to the AdditionalTargetLambda
+		for event in "${lambda_events[@]}"; do
+			event_found=false
+			processed_event=$(echo "$event" | base64 -d | gunzip)
+
+			for snap_path in "${SNAPS[@]}"; do
+				set +e # Don't exit this script if there is a diff
+				diff_output=$(echo "$processed_event" | diff - $snap_path)
+				if [ $? -eq 0 ]; then
+				    event_found=true
+				fi
+				set -e
+			done
+
+			if [ "$event_found" = false ]; then
+			    mismatch_found=true
+			    echo "FAILURE: The following event was not found in the snapshots"
+			    echo ""
+			    echo "$processed_event"
+			    echo ""
+			fi
+		done
+
+		if [ "$mismatch_found" = true ]; then
+		    echo "FAILURE: A mismatch between new data and a snapshot was found and printed above."
+		    exit 1
+		fi
+	done
+
+	sls remove
+	echo "SUCCESS: No difference found between input events and events in the additional target lambda"
+fi
+
+if [ $CACHE_TEST == true ]; then
+	cd $TEST_LAMBDA_DIR
+	sls remove
+
+	aws s3api delete-object --bucket $DD_S3_BUCKET_NAME --key "cache.json"
+	aws s3api delete-bucket --bucket $DD_S3_BUCKET_NAME
+
+	rm policy.json
+fi

@@ -28,13 +28,13 @@ var (
 type (
 	RawTracePayload struct {
 		Message string `json:"message"`
-		Tags string    `json:"tags"`
+		Tags    string `json:"tags"`
 	}
 )
 
 // Configure will set up the bindings
 //export Configure
-func Configure(rootURL, apiKey string) {
+func Configure(rootURL, apiKey string, InsecureSkipVerify bool) {
 	// Need to make a copy of these values, otherwise the underlying memory
 	// might be cleaned up by the runtime.
 	localRootURL := fmt.Sprintf("%s", rootURL)
@@ -53,7 +53,7 @@ func Configure(rootURL, apiKey string) {
 		Redis:             true,
 		Memcached:         true,
 	})
-	edgeConnection = apm.CreateTraceEdgeConnection(localRootURL, localAPIKey)
+	edgeConnection = apm.CreateTraceEdgeConnection(localRootURL, localAPIKey, InsecureSkipVerify)
 }
 
 // returns 0 on success, 1 on error
@@ -132,22 +132,12 @@ func aggregateTracePayloadsByEnv(tracePayloads []*pb.TracePayload) []*pb.TracePa
 }
 
 func sendTracesToIntake(tracePayloads []*pb.TracePayload) error {
-	hadErr := false
 	for _, tracePayload := range tracePayloads {
 		err := edgeConnection.SendTraces(context.Background(), tracePayload, 3)
 		if err != nil {
 			fmt.Printf("Failed to send traces with error %v\n", err)
-			hadErr = true
+			return errors.New("Failed to send traces to intake")
 		}
-		stats := apm.ComputeAPMStats(tracePayload)
-		err = edgeConnection.SendStats(context.Background(), stats, 3)
-		if err != nil {
-			fmt.Printf("Failed to send trace stats with error %v\n", err)
-			hadErr = true
-		}
-	}
-	if hadErr {
-		return errors.New("Failed to send traces or stats to intake")
 	}
 	return nil
 }

@@ -13,43 +13,44 @@ function fakeContext() {
     return contextSpy;
 }
 
-var EventhubLogForwarderInstance = new client.EventhubLogForwarder(
-    fakeContext()
-);
-EventhubLogForwarderInstance.sendWithRetry = function(record) {}; // do nothing
-console.log(EventhubLogForwarderInstance.getLogFormat);
-var handleJsonLogsSpy = sinon.spy();
-var handleStringLogsSpy = sinon.spy();
+function setUp() {
+    var forwarder = new client.EventhubLogForwarder(fakeContext());
+    forwarder.sendWithRetry = function(record) {}; // do nothing
 
-EventhubLogForwarderInstance.addTagsToJsonLog = handleJsonLogsSpy;
-EventhubLogForwarderInstance.addTagsToStringLog = handleStringLogsSpy;
+    forwarder.addTagsToJsonLog = sinon.spy();
+    forwarder.addTagsToStringLog = sinon.spy();
+    return forwarder;
+}
 
 describe('Azure Log Monitoring', function() {
     describe('#getLogFormat', function() {
+        beforeEach(function() {
+            this.forwarder = setUp();
+        });
         it('should return string', function() {
             eventHubMessages = '';
             assert.equal(
                 constants.STRING,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
             eventHubMessages = 'foobar';
             assert.equal(
                 constants.STRING,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
         });
         it('should return string array', function() {
             eventHubMessages = ['', 'foobar'];
             assert.equal(
                 constants.STRING_ARRAY,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
         });
         it('should return json object', function() {
             eventHubMessages = { key: 'value', otherkey: 'othervalue' };
             assert.equal(
                 constants.JSON_OBJECT,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
         });
         it('should return json array when there are no records', function() {
@@ -59,39 +60,42 @@ describe('Azure Log Monitoring', function() {
             ];
             assert.equal(
                 constants.JSON_ARRAY,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
         });
         it('should return invalid', function() {
             eventHubMessages = 1;
             assert.equal(
                 constants.INVALID,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
             eventHubMessages = () => {};
             assert.equal(
                 constants.INVALID,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
             eventHubMessages = true;
             assert.equal(
                 constants.INVALID,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
             eventHubMessages = null;
             assert.equal(
                 constants.INVALID,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
             eventHubMessages = undefined;
             assert.equal(
                 constants.INVALID,
-                EventhubLogForwarderInstance.getLogFormat(eventHubMessages)
+                this.forwarder.getLogFormat(eventHubMessages)
             );
         });
     });
 
-    describe('#extractResourceId', function() {
+    describe('#extractMetadataFromResource', function() {
+        beforeEach(function() {
+            this.forwarder = setUp();
+        });
         it('should parse a valid record', function() {
             record = {
                 resourceId:
@@ -106,13 +110,47 @@ describe('Azure Log Monitoring', function() {
             };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
-        it('should parse a valid record without provider', function() {
+        it('should parse a valid resource group resource', function() {
             record = {
                 resourceId:
                     '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/RESOURCEGROUPS/SOME-RESOURCE-GROUP'
+            };
+            expectedMetadata = {
+                tags: [
+                    'subscription_id:12345678-1234-abcd-1234-1234567890ab',
+                    'resource_group:some-resource-group'
+                ],
+                source: 'azure.resourcegroup'
+            };
+            assert.deepEqual(
+                expectedMetadata,
+                this.forwarder.extractMetadataFromResource(record)
+            );
+        });
+        it('should parse a valid resource group resource ending slash', function() {
+            record = {
+                resourceId:
+                    '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/RESOURCEGROUPS/SOME-RESOURCE-GROUP/'
+            };
+            expectedMetadata = {
+                tags: [
+                    'subscription_id:12345678-1234-abcd-1234-1234567890ab',
+                    'resource_group:some-resource-group'
+                ],
+                source: 'azure.resourcegroup'
+            };
+            assert.deepEqual(
+                expectedMetadata,
+                this.forwarder.extractMetadataFromResource(record)
+            );
+        });
+        it('should parse a valid record without provider length 5', function() {
+            record = {
+                resourceId:
+                    '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/RESOURCEGROUPS/SOME-RESOURCE-GROUP/ffffff'
             };
             expectedMetadata = {
                 tags: [
@@ -123,13 +161,41 @@ describe('Azure Log Monitoring', function() {
             };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
-        it('should parse a valid record without provider and resource group', function() {
+        it('should parse a valid subscription type resource', function() {
             record = {
                 resourceId:
                     '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB'
+            };
+            expectedMetadata = {
+                tags: ['subscription_id:12345678-1234-abcd-1234-1234567890ab'],
+                source: 'azure.subscription'
+            };
+            assert.deepEqual(
+                expectedMetadata,
+                this.forwarder.extractMetadataFromResource(record)
+            );
+        });
+        it('should parse a valid subscription type resource ending slash', function() {
+            record = {
+                resourceId:
+                    '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/'
+            };
+            expectedMetadata = {
+                tags: ['subscription_id:12345678-1234-abcd-1234-1234567890ab'],
+                source: 'azure.subscription'
+            };
+            assert.deepEqual(
+                expectedMetadata,
+                this.forwarder.extractMetadataFromResource(record)
+            );
+        });
+        it('should parse a valid record without provider and resource group length 3', function() {
+            record = {
+                resourceId:
+                    '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/ffffff'
             };
             expectedMetadata = {
                 tags: ['subscription_id:12345678-1234-abcd-1234-1234567890ab'],
@@ -137,7 +203,7 @@ describe('Azure Log Monitoring', function() {
             };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
         it('should not fail on record without resourceId', function() {
@@ -145,7 +211,7 @@ describe('Azure Log Monitoring', function() {
             expectedMetadata = { tags: [], source: '' };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
         it('should not fail on string record', function() {
@@ -153,7 +219,7 @@ describe('Azure Log Monitoring', function() {
             expectedMetadata = { tags: [], source: '' };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
         it('should not fail on improper resourceId', function() {
@@ -161,7 +227,7 @@ describe('Azure Log Monitoring', function() {
             expectedMetadata = { tags: [], source: '' };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
         it('should not fail with an invalid source', function() {
@@ -178,115 +244,196 @@ describe('Azure Log Monitoring', function() {
             };
             assert.deepEqual(
                 expectedMetadata,
-                EventhubLogForwarderInstance.extractResourceId(record)
+                this.forwarder.extractMetadataFromResource(record)
+            );
+        });
+        it('should return empty source when not correct source format', function() {
+            record = {
+                resourceId:
+                    '/SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/RESOURCEGROUPS/SOME-RESOURCE-GROUP/PROVIDERS/NOTTHESAMEFORMAT/VIRTUALMACHINES/SOME-VM'
+            };
+            expectedMetadata = {
+                tags: [
+                    'subscription_id:12345678-1234-abcd-1234-1234567890ab',
+                    'resource_group:some-resource-group'
+                ],
+                source: ''
+            };
+            assert.deepEqual(
+                expectedMetadata,
+                this.forwarder.extractMetadataFromResource(record)
+            );
+        });
+        it('should handle when first element of resource id list is not empty', function() {
+            record = {
+                resourceId:
+                    'SUBSCRIPTIONS/12345678-1234-ABCD-1234-1234567890AB/RESOURCEGROUPS/SOME-RESOURCE-GROUP/PROVIDERS/NOTTHESAMEFORMAT/VIRTUALMACHINES/SOME-VM'
+            };
+            expectedMetadata = {
+                tags: [
+                    'subscription_id:12345678-1234-abcd-1234-1234567890ab',
+                    'resource_group:some-resource-group'
+                ],
+                source: ''
+            };
+            assert.deepEqual(
+                expectedMetadata,
+                this.forwarder.extractMetadataFromResource(record)
             );
         });
     });
 
-    function testHandleLogs(logs, expected, assertJson) {
-        EventhubLogForwarderInstance.handleLogs(record);
-        if (assertJson == true) {
-            expected.forEach(message => {
-                sinon.assert.calledWith(handleJsonLogsSpy, message);
-            });
-        } else {
-            expected.forEach(message => {
-                sinon.assert.calledWith(handleStringLogsSpy, message);
-            });
-        }
+    function testHandleJSONLogs(forwarder, logs, expected) {
+        forwarder.handleLogs(logs);
+        expected.forEach(message => {
+            sinon.assert.calledWith(forwarder.addTagsToJsonLog, message);
+        });
+    }
+
+    function testHandleStringLogs(forwarder, logs, expected) {
+        forwarder.handleLogs(logs);
+        expected.forEach(message => {
+            sinon.assert.calledWith(forwarder.addTagsToStringLog, message);
+        });
     }
 
     describe('#handleLogs', function() {
+        beforeEach(function() {
+            this.forwarder = setUp();
+        });
+
         it('should handle string properly', function() {
-            record = 'hello';
+            log = 'hello';
             expected = ['hello'];
-            assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
-                constants.STRING
-            );
-            testHandleLogs(record, expected, false);
+            assert.equal(this.forwarder.getLogFormat(log), constants.STRING);
+            testHandleStringLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-string properly', function() {
-            record = '{"hello": "there"}';
+            log = '{"hello": "there"}';
             expected = [{ hello: 'there' }];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_STRING
             );
-            testHandleLogs(record, expected, true);
+            testHandleJSONLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-object properly', function() {
-            record = { hello: 'there' };
+            log = { hello: 'there' };
             expected = [{ hello: 'there' }];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_OBJECT
             );
-            testHandleLogs(record, expected, true);
+            testHandleJSONLogs(this.forwarder, log, expected);
         });
 
         it('should handle string-array properly', function() {
-            record = ['one message', 'two message'];
+            log = ['one message', 'two message'];
             expected = ['one message', 'two message'];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.STRING_ARRAY
             );
-            testHandleLogs(record, expected, false);
+            testHandleStringLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-records properly', function() {
-            record = [{ records: [{ hello: 'there' }, { goodbye: 'now' }] }];
+            log = [{ records: [{ hello: 'there' }, { goodbye: 'now' }] }];
             expected = [{ hello: 'there' }, { goodbye: 'now' }];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_ARRAY
             ); //JSON_RECORDS
-            testHandleLogs(record, expected, true);
+            testHandleJSONLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-array properly', function() {
-            record = [{ hello: 'there' }, { goodbye: 'now' }];
+            log = [{ hello: 'there' }, { goodbye: 'now' }];
             expected = [{ hello: 'there' }, { goodbye: 'now' }];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_ARRAY
             );
-            testHandleLogs(record, expected, true);
+            testHandleJSONLogs(this.forwarder, log, expected);
+        });
+
+        it('should handle buffer array properly', function() {
+            log = [Buffer.from('{"records": [{ "test": "testing"}]}')];
+            expected = [{ test: 'testing' }];
+            assert.equal(
+                this.forwarder.getLogFormat(log),
+                constants.BUFFER_ARRAY
+            );
+            testHandleJSONLogs(this.forwarder, log, expected);
+        });
+
+        it('should handle buffer array without records properly', function() {
+            log = [Buffer.from('{ "test": "example"}')];
+            expected = [{ test: 'example' }];
+            assert.equal(
+                this.forwarder.getLogFormat(log),
+                constants.BUFFER_ARRAY
+            );
+            testHandleJSONLogs(this.forwarder, log, expected);
+        });
+
+        it('should handle buffer array with malformed string', function() {
+            log = [Buffer.from('{"time": "xy')];
+            expected = ['{"time": "xy'];
+            assert.equal(
+                this.forwarder.getLogFormat(log),
+                constants.BUFFER_ARRAY
+            );
+            testHandleStringLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-string-array properly records', function() {
-            record = ['{"records": [{ "time": "xyz"}, {"time": "abc"}]}'];
+            log = ['{"records": [{ "time": "xyz"}, {"time": "abc"}]}'];
             expected = [{ time: 'xyz' }];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_STRING_ARRAY
             );
-            testHandleLogs(record, expected, true);
+            testHandleJSONLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-string-array properly no records', function() {
-            record = ['{"time": "xyz"}'];
+            log = ['{"time": "xyz"}'];
             expected = [{ time: 'xyz' }];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_STRING_ARRAY
             );
-            testHandleLogs(record, expected, true);
+            testHandleJSONLogs(this.forwarder, log, expected);
         });
 
         it('should handle json-string-array with malformed string', function() {
-            record = ['{"time": "xyz"}', '{"time": "xy'];
+            log = ['{"time": "xyz"}', '{"time": "xy'];
             expected = ['{"time": "xy'];
             assert.equal(
-                EventhubLogForwarderInstance.getLogFormat(record),
+                this.forwarder.getLogFormat(log),
                 constants.JSON_STRING_ARRAY
             );
             // just assert that the string method is called for the second message,
             // we don't care about the first one for this test
-            testHandleLogs(record, expected, false);
+            testHandleStringLogs(this.forwarder, log, expected);
+        });
+    });
+    describe('#formatSourceType', function() {
+        beforeEach(function() {
+            this.forwarder = setUp();
+        });
+        it('should replace microsoft with azure', function() {
+            expected = 'azure.bleh';
+            actual = this.forwarder.formatSourceType('microsoft.bleh');
+            assert.equal(actual, expected);
+        });
+        it('should return empty source', function() {
+            expected = '';
+            actual = this.forwarder.formatSourceType('something');
+            assert.equal(actual, expected);
         });
     });
 });

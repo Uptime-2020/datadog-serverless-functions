@@ -10,6 +10,7 @@ import os
 from collections import defaultdict
 
 import boto3
+import botocore
 import itertools
 import re
 import urllib
@@ -49,6 +50,8 @@ from settings import (
     DD_SERVICE,
     DD_HOST,
     DD_FORWARDER_VERSION,
+    DD_ADDITIONAL_TARGET_LAMBDAS,
+    DD_USE_VPC,
 )
 
 
@@ -78,7 +81,8 @@ if len(DD_API_KEY) != 32:
     )
 # Validate the API key
 validation_res = requests.get(
-    "{}/api/v1/validate?api_key={}".format(DD_API_URL, DD_API_KEY)
+    "{}/api/v1/validate?api_key={}".format(DD_API_URL, DD_API_KEY),
+    verify=(not DD_SKIP_SSL_VALIDATION),
 )
 if not validation_res.ok:
     raise Exception("The API key is not valid.")
@@ -86,8 +90,11 @@ if not validation_res.ok:
 # Force the layer to use the exact same API key and host as the forwarder
 api._api_key = DD_API_KEY
 api._api_host = DD_API_URL
+api._cacert = not DD_SKIP_SSL_VALIDATION
 
-trace_connection = TraceConnection(DD_TRACE_INTAKE_URL, DD_API_KEY)
+trace_connection = TraceConnection(
+    DD_TRACE_INTAKE_URL, DD_API_KEY, DD_SKIP_SSL_VALIDATION
+)
 
 # Use for include, exclude, and scrubbing rules
 def compileRegex(rule, pattern):
@@ -148,6 +155,11 @@ LOG_SOURCE_SUBSTRINGS = [
 ]
 
 
+# Used to build and pass aws.dd_forwarder.* telemetry tags
+DD_FORWARDER_TELEMETRY_TAGS = []
+DD_FORWARDER_TELEMETRY_NAMESPACE_PREFIX = "aws.dd_forwarder"
+
+
 class RetriableException(Exception):
     pass
 
@@ -197,6 +209,11 @@ class DatadogTCPClient(object):
         self._api_key = api_key
         self._scrubber = scrubber
         self._sock = None
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Initialized tcp client for logs intake: "
+                f"<host: {host}, port: {port}, no_ssl: {no_ssl}>"
+            )
 
     def _connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -256,6 +273,12 @@ class DatadogHTTPClient(object):
         self._timeout = timeout
         self._session = None
         self._ssl_validation = not skip_ssl_validation
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Initialized http client for logs intake: "
+                f"<host: {host}, port: {port}, url: {self._url}, no_ssl: {no_ssl}, "
+                f"skip_ssl_validation: {skip_ssl_validation}, timeout: {timeout}>"
+            )
 
     def _connect(self):
         self._session = requests.Session()
@@ -386,10 +409,13 @@ def datadog_forwarder(event, context):
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"Received Event:{json.dumps(event)}")
 
+    if DD_ADDITIONAL_TARGET_LAMBDAS:
+        invoke_additional_target_lambdas(event)
+
     metrics, logs, trace_payloads = split(enrich(parse(event, context)))
 
     if DD_FORWARD_LOG:
-        forward_logs(filter_logs(map(json.dumps, logs)))
+        forward_logs(logs)
 
     forward_metrics(metrics)
 
@@ -404,6 +430,9 @@ lambda_handler = datadog_lambda_wrapper(datadog_forwarder)
 
 def forward_logs(logs):
     """Forward logs to Datadog"""
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Forwarding {len(logs)} logs")
+    logs_to_forward = filter_logs(list(map(json.dumps, logs)))
     scrubber = DatadogScrubber(SCRUBBING_RULE_CONFIGS)
     if DD_USE_TCP:
         batcher = DatadogBatcher(256 * 1000, 256 * 1000, 1)
@@ -415,7 +444,7 @@ def forward_logs(logs):
         )
 
     with DatadogClient(cli) as client:
-        for batch in batcher.batch(logs):
+        for batch in batcher.batch(logs_to_forward):
             try:
                 client.send(batch)
             except Exception:
@@ -424,13 +453,22 @@ def forward_logs(logs):
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Forwarded log batch: {json.dumps(batch)}")
 
+    lambda_stats.distribution(
+        "{}.logs_forwarded".format(DD_FORWARDER_TELEMETRY_NAMESPACE_PREFIX),
+        len(logs_to_forward),
+        tags=DD_FORWARDER_TELEMETRY_TAGS,
+    )
+
 
 def parse(event, context):
     """Parse Lambda input to normalized events"""
     metadata = generate_metadata(context)
+    event_type = "unknown"
     try:
         # Route to the corresponding parser
         event_type = parse_event_type(event)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Parsed event type: {event_type}")
         if event_type == "s3":
             events = s3_handler(event, context, metadata)
         elif event_type == "awslogs":
@@ -448,7 +486,23 @@ def parse(event, context):
         )
         events = [err_message]
 
+    set_forwarder_telemetry_tags(context, event_type)
+
     return normalize_events(events, metadata)
+
+
+def set_forwarder_telemetry_tags(context, event_type):
+    """Helper function to set tags on telemetry metrics
+    Do not submit telemetry metrics before this helper function is invoked
+    """
+    global DD_FORWARDER_TELEMETRY_TAGS
+
+    DD_FORWARDER_TELEMETRY_TAGS = [
+        f"forwardername:{context.function_name.lower()}",
+        f"forwarder_memorysize:{context.memory_limit_in_mb}",
+        f"forwarder_version:{DD_FORWARDER_VERSION}",
+        f"event_type:{event_type}",
+    ]
 
 
 def enrich(events):
@@ -572,6 +626,7 @@ def generate_metadata(context):
         "forwarder_memorysize": context.memory_limit_in_mb,
         "forwarder_version": DD_FORWARDER_VERSION,
     }
+
     metadata[DD_CUSTOM_TAGS] = ",".join(
         filter(
             None,
@@ -608,6 +663,8 @@ def extract_metric(event):
             return None
         if not isinstance(metric["t"], list):
             return None
+        if not (isinstance(metric["v"], int) or isinstance(metric["v"], float)):
+            return None
 
         metric["t"] += event[DD_CUSTOM_TAGS].split(",")
         return metric
@@ -616,8 +673,7 @@ def extract_metric(event):
 
 
 def split(events):
-    """Split events into metrics, logs, and trace payloads
-    """
+    """Split events into metrics, logs, and trace payloads"""
     metrics, logs, trace_payloads = [], [], []
     for event in events:
         metric = extract_metric(event)
@@ -628,6 +684,12 @@ def split(events):
             trace_payloads.append(trace_payload)
         else:
             logs.append(event)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"Extracted {len(metrics)} metrics, {len(trace_payloads)} traces, and {len(logs)} logs"
+        )
+
     return metrics, logs, trace_payloads
 
 
@@ -664,6 +726,9 @@ def forward_metrics(metrics):
     Forward custom metrics submitted via logs to Datadog in a background thread
     using `lambda_stats` that is provided by the Datadog Python Lambda Layer.
     """
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Forwarding {len(metrics)} metrics")
+
     for metric in metrics:
         try:
             lambda_stats.distribution(
@@ -675,8 +740,17 @@ def forward_metrics(metrics):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Forwarded metric: {json.dumps(metric)}")
 
+    lambda_stats.distribution(
+        "{}.metrics_forwarded".format(DD_FORWARDER_TELEMETRY_NAMESPACE_PREFIX),
+        len(metrics),
+        tags=DD_FORWARDER_TELEMETRY_TAGS,
+    )
+
 
 def forward_traces(trace_payloads):
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"Forwarding {len(trace_payloads)} traces")
+
     try:
         trace_connection.send_traces(trace_payloads)
     except Exception:
@@ -687,13 +761,22 @@ def forward_traces(trace_payloads):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"Forwarded traces: {json.dumps(trace_payloads)}")
 
+    lambda_stats.distribution(
+        "{}.traces_forwarded".format(DD_FORWARDER_TELEMETRY_NAMESPACE_PREFIX),
+        len(trace_payloads),
+        tags=DD_FORWARDER_TELEMETRY_TAGS,
+    )
+
 
 # Utility functions
 
 
 def normalize_events(events, metadata):
     normalized = []
+    events_counter = 0
+
     for event in events:
+        events_counter += 1
         if isinstance(event, dict):
             normalized.append(merge_dicts(event, metadata))
         elif isinstance(event, str):
@@ -701,6 +784,14 @@ def normalize_events(events, metadata):
         else:
             # drop this log
             continue
+
+    """Submit count of total events"""
+    lambda_stats.distribution(
+        "{}.incoming_events".format(DD_FORWARDER_TELEMETRY_NAMESPACE_PREFIX),
+        events_counter,
+        tags=DD_FORWARDER_TELEMETRY_TAGS,
+    )
+
     return normalized
 
 
@@ -709,6 +800,16 @@ def parse_event_type(event):
         if "s3" in event["Records"][0]:
             return "s3"
         elif "Sns" in event["Records"][0]:
+            # it's not uncommon to fan out s3 notifications through SNS,
+            # should treat it as an s3 event rather than sns event.
+            sns_msg = event["Records"][0]["Sns"]["Message"]
+            try:
+                sns_msg_dict = json.loads(sns_msg)
+                if "Records" in sns_msg_dict and "s3" in sns_msg_dict["Records"][0]:
+                    return "s3"
+            except Exception:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"No s3 event detected from SNS message: {sns_msg}")
             return "sns"
         elif "kinesis" in event["Records"][0]:
             return "kinesis"
@@ -729,7 +830,19 @@ def parse_hostname_from_event(event):
 
 # Handle S3 events
 def s3_handler(event, context, metadata):
-    s3 = boto3.client("s3")
+    # Need to use path style to access s3 via VPC Endpoints
+    # https://github.com/gford1000-aws/lambda_s3_access_using_vpc_endpoint#boto3-specific-notes
+    if DD_USE_VPC:
+        s3 = boto3.client(
+            "s3",
+            os.environ["AWS_REGION"],
+            config=botocore.config.Config(s3={"addressing_style": "path"}),
+        )
+    else:
+        s3 = boto3.client("s3")
+    # if this is a S3 event carried in a SNS message, extract it and override the event
+    if "Sns" in event["Records"][0]:
+        event = json.loads(event["Records"][0]["Sns"]["Message"])
 
     # Get the object from the event and show its content type
     bucket = event["Records"][0]["s3"]["bucket"]["name"]
@@ -1037,4 +1150,24 @@ def parse_service_arn(source, key, bucket, context):
                 return "arn:aws:redshift:{}:{}:cluster:{}:".format(
                     region, accountID, clustername
                 )
+    return
+
+
+def invoke_additional_target_lambdas(event):
+    lambda_client = boto3.client("lambda")
+    lambda_arns = DD_ADDITIONAL_TARGET_LAMBDAS.split(",")
+    lambda_payload = json.dumps(event)
+
+    for lambda_arn in lambda_arns:
+        try:
+            lambda_client.invoke(
+                FunctionName=lambda_arn,
+                InvocationType="Event",
+                Payload=lambda_payload,
+            )
+        except Exception as e:
+            logger.exception(
+                f"Failed to invoke additional target lambda {lambda_arn} due to {e}"
+            )
+
     return
