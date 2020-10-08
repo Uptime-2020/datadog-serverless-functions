@@ -4,7 +4,7 @@ Description: Pushes logs, metrics and traces from AWS to Datadog.
 Mappings:
   Constants:
     DdForwarder:
-      Version: 3.16.4
+      Version: 3.16.8
 Parameters:
   DdApiKey:
     Type: String
@@ -48,6 +48,10 @@ Parameters:
     Type: String
     Default: ""
     Description: DO NOT CHANGE unless you know what you are doing. Override the default location of the function source code.
+  DdSource:
+    Type: String
+    Default: ""
+    Description: Add custom DD_SOURCE environment variable
   DdTags:
     Type: String
     Default: ""
@@ -183,6 +187,11 @@ Conditions:
     Fn::Equals:
       - !Select [0, !Split ["/", !Ref SourceZipUrl]]
       - "s3:"
+  SetDdSource:
+    Fn::Not:
+      - Fn::Equals:
+        - Ref: DdSource
+        - ""
   SetDdTags:
     Fn::Not:
       - Fn::Equals:
@@ -307,6 +316,11 @@ Resources:
               - Ref: DdApiKeySecretArn
           DD_SITE:
             Ref: DdSite
+          DD_SOURCE:
+            Fn::If:
+              - SetDdSource
+              - Ref: DdSource
+              - Ref: AWS::NoValue
           DD_TAGS:
             Fn::If:
               - SetDdTags
@@ -639,6 +653,7 @@ Metadata:
       - Label:
           default: Log Forwarding (Optional)
         Parameters:
+          - DdSource
           - DdTags
           - DdMultilineLogRegexPattern
           - DdUseTcp

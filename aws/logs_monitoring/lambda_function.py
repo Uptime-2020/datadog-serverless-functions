@@ -721,6 +721,12 @@ def parse_event_type(event):
     raise Exception("Event type not supported (see #Event supported section)")
 
 
+# Handle S3 events that are cloudflare-based
+def parse_hostname_from_event(event):
+    source = ''
+    hostname = ''
+    return {'source': source, 'hostname': hostname}
+
 # Handle S3 events
 def s3_handler(event, context, metadata):
     s3 = boto3.client("s3")
@@ -729,11 +735,11 @@ def s3_handler(event, context, metadata):
     bucket = event["Records"][0]["s3"]["bucket"]["name"]
     key = urllib.parse.unquote_plus(event["Records"][0]["s3"]["object"]["key"])
 
+    print(key)
+    print(event)
+
     source = parse_event_source(event, key)
-    if DD_SOURCE is not None:
-        metadata[DD_SOURCE] = DD_SOURCE
-    else:
-        metadata[DD_SOURCE] = source
+    metadata[DD_SOURCE] = "cloudflare"
     ##default service to source value
     metadata[DD_SERVICE] = source
     ##Get the ARN of the service and set it as the hostname
